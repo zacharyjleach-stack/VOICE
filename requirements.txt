@@ -4,3 +4,9 @@ faster-whisper
 speechbrain
 transformers
 numpy
+
+# Listener & TTS (optional — install what you need)
+pyaudio           # Microphone capture
+elevenlabs        # ElevenLabs TTS (studio-quality voice)
+pyttsx3           # Local offline TTS (fallback)
+pvporcupine       # Porcupine wake word (optional, needs API key)
