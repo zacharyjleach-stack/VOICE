@@ -1,32 +1,125 @@
-"""Voice Activity Detection (VAD) engine.
+"""Voice Activity Detection (VAD) engine — Silero Neural Network backend.
 
-Implements a multi-feature energy-based VAD with adaptive thresholding.
-Designed for production use with real-time streaming and batch modes.
+Uses the Silero VAD model (via torch.hub) for state-of-the-art speech
+detection. Replaces the legacy energy/ZCR heuristic approach with a
+compact neural network that runs locally on CPU, CUDA, or MPS.
+
+The Silero model is downloaded automatically on first run (~1MB).
 """
 
 from __future__ import annotations
 
-import numpy as np
+import sys
+from pathlib import Path
+from typing import Optional
 
-from voicekit.core.audio import AudioEngine
+import numpy as np
+import torch
+
 from voicekit.core.types import AudioConfig, AudioSegment, VADResult, VoiceSegment
 
 
-class VoiceActivityDetector:
-    """Detects speech segments in audio using multi-feature analysis.
+def _detect_device() -> str:
+    """Auto-detect the best available compute device."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
-    Combines frame energy, zero-crossing rate, and spectral features
-    to determine voiced regions with adaptive thresholding.
+
+class SileroVoiceDetector:
+    """Neural VAD powered by Silero VAD v5.
+
+    Loads the Silero model once on init and provides both single-frame
+    and full-segment speech detection.
+
+    Args:
+        config: Audio processing configuration (sample_rate should be 16000).
+        device: Compute device ("cpu", "cuda", "mps", or None for auto-detect).
+        threshold: Speech probability threshold (0.0-1.0). Default 0.5.
     """
 
+    SUPPORTED_SAMPLE_RATES = (8000, 16000)
+
     def __init__(
-        self, config: AudioConfig | None = None, engine: AudioEngine | None = None
+        self,
+        config: AudioConfig | None = None,
+        device: str | None = None,
+        threshold: float = 0.5,
     ) -> None:
         self.config = config or AudioConfig()
-        self.engine = engine or AudioEngine(self.config)
+        self.device = device or _detect_device()
+        self.threshold = threshold
+
+        # Load Silero VAD model
+        try:
+            self._model, self._utils = torch.hub.load(
+                repo_or_dir="snakers4/silero-vad",
+                model="silero_vad",
+                force_reload=False,
+                trust_repo=True,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load Silero VAD model. Ensure you have internet "
+                f"access for the initial download. Error: {e}"
+            ) from e
+
+        self._model = self._model.to(self.device)
+        self._model.eval()
+
+        # Extract utility functions from Silero's bundle
+        (
+            self._get_speech_timestamps,
+            _,  # save_audio
+            _,  # read_audio
+            _,  # VADIterator
+            _,  # collect_chunks
+        ) = self._utils
+
+    def is_speech(self, audio_frame: np.ndarray) -> bool:
+        """Classify a single audio frame as speech or non-speech.
+
+        Args:
+            audio_frame: 1-D numpy array of audio samples (16kHz, mono).
+                         Recommended frame sizes: 512, 1024, or 1536 samples.
+
+        Returns:
+            True if the frame contains speech.
+        """
+        tensor = torch.from_numpy(audio_frame).float().to(self.device)
+        if tensor.dim() == 1:
+            tensor = tensor.unsqueeze(0)
+
+        with torch.no_grad():
+            prob = self._model(tensor, self.config.sample_rate).item()
+
+        return prob >= self.threshold
+
+    def speech_probability(self, audio_frame: np.ndarray) -> float:
+        """Return the raw speech probability for a single frame.
+
+        Args:
+            audio_frame: 1-D numpy array of audio samples (16kHz, mono).
+
+        Returns:
+            Speech probability between 0.0 and 1.0.
+        """
+        tensor = torch.from_numpy(audio_frame).float().to(self.device)
+        if tensor.dim() == 1:
+            tensor = tensor.unsqueeze(0)
+
+        with torch.no_grad():
+            prob = self._model(tensor, self.config.sample_rate).item()
+
+        return float(prob)
 
     def detect(self, segment: AudioSegment) -> VADResult:
-        """Run voice activity detection on an audio segment.
+        """Run full voice activity detection on an audio segment.
+
+        Uses Silero's get_speech_timestamps for optimal segment-level
+        detection with built-in smoothing and merging.
 
         Args:
             segment: Audio segment to analyze.
@@ -34,51 +127,49 @@ class VoiceActivityDetector:
         Returns:
             VADResult with detected speech segments and statistics.
         """
-        frames = self.engine.extract_frames(segment)
-        if not frames:
+        samples = np.array(segment.samples, dtype=np.float32)
+        if len(samples) == 0:
             return VADResult(total_duration_seconds=segment.duration_seconds)
 
-        # Compute per-frame features
-        energies = np.array([self.engine.compute_energy(f) for f in frames])
-        zcrs = np.array([self.engine.compute_zcr(f) for f in frames])
-        spectral_flatness = np.array(
-            [self._spectral_flatness(f) for f in frames]
-        )
+        audio_tensor = torch.from_numpy(samples).float().to(self.device)
 
-        # Adaptive threshold based on energy distribution
-        energy_threshold = self._compute_adaptive_threshold(energies)
+        # Reset model state for clean segment processing
+        self._model.reset_states()
 
-        # ZCR threshold — speech typically has moderate ZCR
-        zcr_low, zcr_high = 0.02, 0.35
-
-        # Classify each frame
-        frame_labels = np.zeros(len(frames), dtype=np.int32)
-        for i in range(len(frames)):
-            is_energetic = energies[i] > energy_threshold
-            is_speech_zcr = zcr_low <= zcrs[i] <= zcr_high
-            is_not_noise = spectral_flatness[i] < 0.85
-
-            score = (
-                0.5 * float(is_energetic)
-                + 0.25 * float(is_speech_zcr)
-                + 0.25 * float(is_not_noise)
+        try:
+            speech_timestamps = self._get_speech_timestamps(
+                audio_tensor,
+                self._model,
+                sampling_rate=self.config.sample_rate,
+                threshold=self.threshold,
+                min_speech_duration_ms=self.config.min_speech_duration_ms,
+                min_silence_duration_ms=self.config.max_silence_duration_ms,
+                return_seconds=False,
             )
-            if score >= self.config.vad_threshold:
-                frame_labels[i] = 1
+        except Exception:
+            # Fallback: process frame-by-frame if timestamps API fails
+            return self._detect_frame_by_frame(segment)
 
-        # Apply hangover scheme to smooth detections
-        frame_labels = self._apply_hangover(frame_labels)
+        sr = self.config.sample_rate
+        voice_segments: list[VoiceSegment] = []
 
-        # Convert frame labels to time segments
-        segments = self._labels_to_segments(
-            frame_labels, segment.sample_rate, energies
-        )
+        for ts in speech_timestamps:
+            start_s = ts["start"] / sr
+            end_s = ts["end"] / sr
 
-        # Filter short segments
-        min_dur = self.config.min_speech_duration_ms / 1000
-        segments = [s for s in segments if s.duration_seconds >= min_dur]
+            # Compute confidence from the frames within this segment
+            chunk = samples[ts["start"] : ts["end"]]
+            confidence = self._estimate_segment_confidence(chunk)
 
-        total_speech = sum(s.duration_seconds for s in segments)
+            voice_segments.append(
+                VoiceSegment(
+                    start_seconds=round(start_s, 4),
+                    end_seconds=round(end_s, 4),
+                    confidence=confidence,
+                )
+            )
+
+        total_speech = sum(s.duration_seconds for s in voice_segments)
         speech_ratio = (
             total_speech / segment.duration_seconds
             if segment.duration_seconds > 0
@@ -86,171 +177,123 @@ class VoiceActivityDetector:
         )
 
         return VADResult(
-            segments=segments,
-            speech_ratio=speech_ratio,
-            total_speech_seconds=total_speech,
+            segments=voice_segments,
+            speech_ratio=round(speech_ratio, 4),
+            total_speech_seconds=round(total_speech, 4),
             total_duration_seconds=segment.duration_seconds,
         )
 
     def detect_streaming(
         self, frame: np.ndarray, state: dict | None = None
     ) -> tuple[bool, float, dict]:
-        """Process a single frame for streaming/real-time VAD.
+        """Process a single frame for real-time streaming VAD.
+
+        Maintains internal state across calls for smooth detection.
 
         Args:
-            frame: Single audio frame as numpy array.
-            state: Persistent state dict from previous call (or None for first).
+            frame: Single audio frame as numpy array (16kHz, mono).
+            state: Persistent state dict from previous call (or None).
 
         Returns:
             Tuple of (is_speech, confidence, updated_state).
         """
         if state is None:
-            state = {
-                "energy_history": [],
-                "hangover_counter": 0,
-                "speech_active": False,
-            }
+            self._model.reset_states()
+            state = {"frame_count": 0, "speech_active": False}
 
-        energy = self.engine.compute_energy(frame)
-        zcr = self.engine.compute_zcr(frame)
-        flatness = self._spectral_flatness(frame)
+        prob = self.speech_probability(frame)
+        is_speech = prob >= self.threshold
 
-        state["energy_history"].append(energy)
-        # Keep rolling window
-        if len(state["energy_history"]) > 100:
-            state["energy_history"] = state["energy_history"][-100:]
+        state["frame_count"] += 1
+        state["speech_active"] = is_speech
 
-        threshold = self._compute_adaptive_threshold(
-            np.array(state["energy_history"])
-        )
+        return is_speech, prob, state
 
-        is_energetic = energy > threshold
-        is_speech_zcr = 0.02 <= zcr <= 0.35
-        is_not_noise = flatness < 0.85
+    def _detect_frame_by_frame(self, segment: AudioSegment) -> VADResult:
+        """Fallback frame-by-frame detection."""
+        samples = np.array(segment.samples, dtype=np.float32)
+        sr = self.config.sample_rate
+        frame_size = 512  # Silero-recommended frame size for 16kHz
+        frame_dur = frame_size / sr
 
-        confidence = (
-            0.5 * float(is_energetic)
-            + 0.25 * float(is_speech_zcr)
-            + 0.25 * float(is_not_noise)
-        )
+        self._model.reset_states()
 
-        is_speech = confidence >= self.config.vad_threshold
+        labels: list[tuple[float, bool, float]] = []
+        for start in range(0, len(samples) - frame_size, frame_size):
+            frame = samples[start : start + frame_size]
+            prob = self.speech_probability(frame)
+            time_s = start / sr
+            labels.append((time_s, prob >= self.threshold, prob))
 
-        # Hangover logic
-        hangover_frames = int(
-            self.config.max_silence_duration_ms
-            / self.config.frame_duration_ms
-        )
-        if is_speech:
-            state["hangover_counter"] = hangover_frames
-            state["speech_active"] = True
-        elif state["hangover_counter"] > 0:
-            state["hangover_counter"] -= 1
-            is_speech = True
-        else:
-            state["speech_active"] = False
+        # Merge consecutive speech frames into segments
+        voice_segments: list[VoiceSegment] = []
+        seg_start: float | None = None
+        seg_probs: list[float] = []
 
-        return is_speech, confidence, state
+        for time_s, is_speech, prob in labels:
+            if is_speech and seg_start is None:
+                seg_start = time_s
+                seg_probs = [prob]
+            elif is_speech and seg_start is not None:
+                seg_probs.append(prob)
+            elif not is_speech and seg_start is not None:
+                end_s = time_s + frame_dur
+                dur = end_s - seg_start
+                if dur >= self.config.min_speech_duration_ms / 1000:
+                    voice_segments.append(
+                        VoiceSegment(
+                            start_seconds=round(seg_start, 4),
+                            end_seconds=round(end_s, 4),
+                            confidence=round(float(np.mean(seg_probs)), 4),
+                        )
+                    )
+                seg_start = None
+                seg_probs = []
 
-    def _compute_adaptive_threshold(self, energies: np.ndarray) -> float:
-        """Compute adaptive energy threshold using noise floor estimation."""
-        if len(energies) == 0:
-            return -30.0
-
-        sorted_e = np.sort(energies)
-        # Estimate noise floor from quietest 20%
-        noise_count = max(1, len(sorted_e) // 5)
-        noise_floor = np.mean(sorted_e[:noise_count])
-
-        # Threshold between noise floor and signal
-        signal_level = np.mean(sorted_e[-noise_count:])
-        threshold = noise_floor + 0.4 * (signal_level - noise_floor)
-
-        return float(threshold)
-
-    def _spectral_flatness(self, frame: np.ndarray) -> float:
-        """Compute spectral flatness (Wiener entropy). 1.0 = noise, 0.0 = tonal."""
-        spectrum = np.abs(np.fft.rfft(frame))
-        spectrum = spectrum[1:]  # Skip DC
-        if len(spectrum) == 0 or np.max(spectrum) == 0:
-            return 1.0
-
-        spectrum = np.maximum(spectrum, 1e-10)
-        geo_mean = np.exp(np.mean(np.log(spectrum)))
-        arith_mean = np.mean(spectrum)
-
-        if arith_mean == 0:
-            return 1.0
-        return float(geo_mean / arith_mean)
-
-    def _apply_hangover(self, labels: np.ndarray) -> np.ndarray:
-        """Apply hangover scheme to smooth frame classifications."""
-        hangover_frames = int(
-            self.config.max_silence_duration_ms
-            / self.config.frame_duration_ms
-        )
-        result = labels.copy()
-        counter = 0
-
-        for i in range(len(result)):
-            if labels[i] == 1:
-                counter = hangover_frames
-            elif counter > 0:
-                result[i] = 1
-                counter -= 1
-        return result
-
-    def _labels_to_segments(
-        self,
-        labels: np.ndarray,
-        sample_rate: int,
-        energies: np.ndarray,
-    ) -> list[VoiceSegment]:
-        """Convert binary frame labels to VoiceSegment list."""
-        frame_dur = self.config.frame_duration_ms / 1000.0
-        segments: list[VoiceSegment] = []
-        start_idx: int | None = None
-
-        for i in range(len(labels)):
-            if labels[i] == 1 and start_idx is None:
-                start_idx = i
-            elif labels[i] == 0 and start_idx is not None:
-                seg_energies = energies[start_idx:i]
-                confidence = self._segment_confidence(seg_energies, energies)
-                segments.append(
+        if seg_start is not None:
+            end_s = len(samples) / sr
+            dur = end_s - seg_start
+            if dur >= self.config.min_speech_duration_ms / 1000:
+                voice_segments.append(
                     VoiceSegment(
-                        start_seconds=start_idx * frame_dur,
-                        end_seconds=i * frame_dur,
-                        confidence=confidence,
+                        start_seconds=round(seg_start, 4),
+                        end_seconds=round(end_s, 4),
+                        confidence=round(float(np.mean(seg_probs)), 4),
                     )
                 )
-                start_idx = None
 
-        # Handle segment ending at the last frame
-        if start_idx is not None:
-            seg_energies = energies[start_idx:]
-            confidence = self._segment_confidence(seg_energies, energies)
-            segments.append(
-                VoiceSegment(
-                    start_seconds=start_idx * frame_dur,
-                    end_seconds=len(labels) * frame_dur,
-                    confidence=confidence,
-                )
-            )
+        total_speech = sum(s.duration_seconds for s in voice_segments)
+        speech_ratio = (
+            total_speech / segment.duration_seconds
+            if segment.duration_seconds > 0
+            else 0.0
+        )
 
-        return segments
+        return VADResult(
+            segments=voice_segments,
+            speech_ratio=round(speech_ratio, 4),
+            total_speech_seconds=round(total_speech, 4),
+            total_duration_seconds=segment.duration_seconds,
+        )
 
-    def _segment_confidence(
-        self, seg_energies: np.ndarray, all_energies: np.ndarray
-    ) -> float:
-        """Estimate confidence for a speech segment."""
-        if len(seg_energies) == 0:
-            return 0.0
-        sorted_all = np.sort(all_energies)
-        noise_count = max(1, len(sorted_all) // 5)
-        noise_floor = np.mean(sorted_all[:noise_count])
-        seg_mean = np.mean(seg_energies)
-        diff = seg_mean - noise_floor
-        # Normalize to [0, 1] — 20dB above noise = max confidence
-        confidence = min(max(diff / 20.0, 0.0), 1.0)
-        return float(confidence)
+    def _estimate_segment_confidence(self, chunk: np.ndarray) -> float:
+        """Estimate confidence for a speech segment by sampling frames."""
+        frame_size = 512
+        if len(chunk) < frame_size:
+            return self.speech_probability(chunk) if len(chunk) > 0 else 0.0
+
+        # Sample up to 5 evenly-spaced frames for efficiency
+        n_frames = min(5, len(chunk) // frame_size)
+        step = len(chunk) // n_frames
+        probs = []
+        for i in range(n_frames):
+            start = i * step
+            frame = chunk[start : start + frame_size]
+            if len(frame) == frame_size:
+                probs.append(self.speech_probability(frame))
+
+        return round(float(np.mean(probs)), 4) if probs else 0.0
+
+
+# Backward-compatible alias so existing imports keep working
+VoiceActivityDetector = SileroVoiceDetector

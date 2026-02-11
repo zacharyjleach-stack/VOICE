@@ -1,232 +1,313 @@
-"""Speaker detection, embedding, and identification engine.
+"""Speaker detection and biometric verification — SpeechBrain ECAPA-TDNN backend.
 
-Generates speaker embeddings that can be used for:
-- Speaker verification (is this the same person?)
-- Speaker identification (who is speaking?)
-- Speaker diarization (segment by speaker)
+Uses the SpeechBrain ECAPA-TDNN model (pretrained on VoxCeleb) for
+state-of-the-art speaker verification. Replaces the legacy MFCC-based
+heuristics with a production-grade neural speaker encoder.
+
+The model (~80MB) is downloaded automatically on first run.
 """
 
 from __future__ import annotations
 
-import hashlib
+import os
+import tempfile
+import wave
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import torch
 
-from voicekit.core.audio import AudioEngine
 from voicekit.core.types import AudioConfig, AudioSegment, SpeakerResult
 
 
-class SpeakerDetector:
-    """Generates speaker embeddings and performs speaker identification.
+def _detect_device() -> str:
+    """Auto-detect the best available compute device."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
-    Uses MFCC-based statistical features to create speaker-discriminative
-    embeddings. Supports enrollment-based identification against a speaker
-    database.
+
+def _segment_to_wav_path(segment: AudioSegment) -> str:
+    """Write an AudioSegment to a temporary WAV file.
+
+    SpeechBrain's verification API expects file paths, so we
+    materialize in-memory audio to a temp file.
+
+    Returns:
+        Path to the temporary WAV file.
+    """
+    samples = np.array(segment.samples, dtype=np.float32)
+    int_samples = (samples * 32767).astype(np.int16)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    try:
+        with wave.open(tmp.name, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(segment.sample_rate)
+            wf.writeframes(int_samples.tobytes())
+    except Exception:
+        os.unlink(tmp.name)
+        raise
+    return tmp.name
+
+
+class VoiceBiometrics:
+    """Neural speaker verification powered by SpeechBrain ECAPA-TDNN.
+
+    Uses the pretrained `speechbrain/spkrec-ecapa-voxceleb` model for
+    speaker embedding extraction and verification. Embeddings are
+    192-dimensional and L2-normalized.
+
+    Args:
+        device: Compute device ("cpu", "cuda", "mps", or None for auto).
+        threshold: Cosine similarity threshold for verification.
+            Default 0.25 (SpeechBrain's recommended threshold for ECAPA).
+        cache_dir: Directory to cache the downloaded model.
     """
 
+    MODEL_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
+    EMBEDDING_DIM = 192
+
     def __init__(
-        self, config: AudioConfig | None = None, engine: AudioEngine | None = None
+        self,
+        device: str | None = None,
+        threshold: float = 0.25,
+        cache_dir: str | None = None,
     ) -> None:
-        self.config = config or AudioConfig()
-        self.engine = engine or AudioEngine(self.config)
-        self._enrolled: dict[str, np.ndarray] = {}
+        self.device = device or _detect_device()
+        self.threshold = threshold
+        self._enrolled: dict[str, torch.Tensor] = {}
+
+        try:
+            from speechbrain.inference.speaker import SpeakerRecognition
+        except ImportError:
+            raise ImportError(
+                "SpeechBrain is required for speaker verification. "
+                "Install with: pip install speechbrain"
+            )
+
+        savedir = cache_dir or os.path.join(
+            tempfile.gettempdir(), "voicekit_speechbrain_cache"
+        )
+
+        try:
+            self._model = SpeakerRecognition.from_hparams(
+                source=self.MODEL_SOURCE,
+                savedir=savedir,
+                run_opts={"device": self.device},
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load SpeechBrain ECAPA-TDNN model. "
+                f"The model (~80MB) is downloaded automatically on first run. "
+                f"Ensure internet access and disk space. Error: {e}"
+            ) from e
+
+    def verify_speaker(
+        self,
+        incoming_audio_path: str | Path,
+        reference_audio_path: str | Path,
+    ) -> tuple[bool, float]:
+        """Verify if two audio files are from the same speaker.
+
+        Args:
+            incoming_audio_path: Path to the audio to verify.
+            reference_audio_path: Path to the reference/enrolled audio.
+
+        Returns:
+            Tuple of (is_match, confidence_score).
+            is_match is True if similarity exceeds the threshold.
+            confidence_score is the cosine similarity (-1.0 to 1.0).
+        """
+        try:
+            score, prediction = self._model.verify_files(
+                str(incoming_audio_path),
+                str(reference_audio_path),
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Speaker verification failed: {e}"
+            ) from e
+
+        similarity = float(score.item())
+        is_match = similarity >= self.threshold
+
+        return is_match, round(similarity, 4)
+
+    def extract_embedding(self, audio_path: str | Path) -> np.ndarray:
+        """Extract a 192-dim speaker embedding from an audio file.
+
+        Args:
+            audio_path: Path to audio file.
+
+        Returns:
+            L2-normalized numpy array of shape (192,).
+        """
+        try:
+            embedding = self._model.encode_batch(
+                self._load_audio_tensor(audio_path)
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Embedding extraction failed for '{audio_path}': {e}"
+            ) from e
+
+        emb = embedding.squeeze().cpu().numpy().astype(np.float32)
+
+        # L2 normalize
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+
+        return emb
+
+    def extract_embedding_from_segment(
+        self, segment: AudioSegment
+    ) -> np.ndarray:
+        """Extract speaker embedding from an in-memory AudioSegment.
+
+        Args:
+            segment: AudioSegment with audio data.
+
+        Returns:
+            L2-normalized numpy array of shape (192,).
+        """
+        tmp_path = _segment_to_wav_path(segment)
+        try:
+            return self.extract_embedding(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+    def enroll(self, speaker_id: str, audio_path: str | Path) -> np.ndarray:
+        """Enroll a speaker for later identification.
+
+        Args:
+            speaker_id: Unique label for the speaker.
+            audio_path: Path to enrollment audio.
+
+        Returns:
+            Speaker embedding vector.
+        """
+        embedding = self.extract_embedding(audio_path)
+        self._enrolled[speaker_id] = torch.from_numpy(embedding)
+        return embedding
+
+    def enroll_from_segment(
+        self, speaker_id: str, segment: AudioSegment
+    ) -> np.ndarray:
+        """Enroll a speaker from an in-memory AudioSegment.
+
+        Args:
+            speaker_id: Unique label for the speaker.
+            segment: AudioSegment with speaker audio.
+
+        Returns:
+            Speaker embedding vector.
+        """
+        embedding = self.extract_embedding_from_segment(segment)
+        self._enrolled[speaker_id] = torch.from_numpy(embedding)
+        return embedding
+
+    def identify(self, audio_path: str | Path) -> tuple[Optional[str], float]:
+        """Identify a speaker from enrolled speakers.
+
+        Args:
+            audio_path: Path to audio to identify.
+
+        Returns:
+            Tuple of (speaker_id, confidence). speaker_id is None if
+            no enrolled speaker matches above the threshold.
+        """
+        if not self._enrolled:
+            return None, 0.0
+
+        embedding = torch.from_numpy(self.extract_embedding(audio_path))
+
+        best_id: Optional[str] = None
+        best_score = -1.0
+
+        for speaker_id, enrolled_emb in self._enrolled.items():
+            score = float(
+                torch.nn.functional.cosine_similarity(
+                    embedding.unsqueeze(0),
+                    enrolled_emb.unsqueeze(0),
+                ).item()
+            )
+            if score > best_score:
+                best_score = score
+                best_id = speaker_id
+
+        if best_score >= self.threshold:
+            return best_id, round(best_score, 4)
+        return None, round(best_score, 4)
 
     def detect(self, segment: AudioSegment) -> SpeakerResult:
-        """Generate speaker embedding and optionally identify the speaker.
+        """Generate speaker embedding and ID from an AudioSegment.
+
+        Maintains backward compatibility with the original SDK interface.
 
         Args:
             segment: Audio segment to analyze.
 
         Returns:
-            SpeakerResult with embedding and optional speaker identification.
+            SpeakerResult with neural embedding and optional identification.
         """
-        embedding = self.extract_embedding(segment)
-        speaker_id, confidence = self._identify(embedding)
+        embedding = self.extract_embedding_from_segment(segment)
+
+        # Try identification if speakers are enrolled
+        speaker_id: Optional[str] = None
+        confidence = 0.0
+
+        if self._enrolled:
+            emb_tensor = torch.from_numpy(embedding)
+            best_id = None
+            best_score = -1.0
+
+            for sid, enrolled_emb in self._enrolled.items():
+                score = float(
+                    torch.nn.functional.cosine_similarity(
+                        emb_tensor.unsqueeze(0),
+                        enrolled_emb.unsqueeze(0),
+                    ).item()
+                )
+                if score > best_score:
+                    best_score = score
+                    best_id = sid
+
+            if best_score >= self.threshold:
+                speaker_id = best_id
+            confidence = best_score
 
         return SpeakerResult(
             embedding=embedding.tolist(),
             speaker_count=1,
             speaker_id=speaker_id,
-            confidence=confidence,
+            confidence=round(confidence, 4),
         )
 
-    def extract_embedding(self, segment: AudioSegment) -> np.ndarray:
-        """Extract a fixed-length speaker embedding from audio.
+    def _load_audio_tensor(self, audio_path: str | Path) -> torch.Tensor:
+        """Load audio file as a torch tensor for SpeechBrain."""
+        try:
+            import torchaudio
 
-        The embedding captures speaker-discriminative features derived
-        from MFCC statistics (means, variances, deltas).
+            waveform, sr = torchaudio.load(str(audio_path))
+            # Resample to 16kHz if needed
+            if sr != 16000:
+                resampler = torchaudio.transforms.Resample(sr, 16000)
+                waveform = resampler(waveform)
+            # Convert to mono if stereo
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            return waveform.to(self.device)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load audio '{audio_path}': {e}"
+            ) from e
 
-        Args:
-            segment: Audio segment to process.
 
-        Returns:
-            Numpy array of shape (embedding_dim,).
-        """
-        mfccs = self.engine.extract_mfcc(segment, n_mfcc=20)
-
-        if mfccs.shape[1] == 0:
-            return np.zeros(self.config.embedding_dim, dtype=np.float32)
-
-        # Statistical features from MFCCs
-        features = []
-
-        # Mean and std of each coefficient
-        features.append(np.mean(mfccs, axis=1))
-        features.append(np.std(mfccs, axis=1))
-
-        # Delta features (first derivative)
-        if mfccs.shape[1] > 2:
-            deltas = np.diff(mfccs, axis=1)
-            features.append(np.mean(deltas, axis=1))
-            features.append(np.std(deltas, axis=1))
-
-            # Delta-delta features (second derivative)
-            if deltas.shape[1] > 2:
-                delta_deltas = np.diff(deltas, axis=1)
-                features.append(np.mean(delta_deltas, axis=1))
-                features.append(np.std(delta_deltas, axis=1))
-
-        # Skewness and kurtosis for more discriminative power
-        features.append(self._safe_skewness(mfccs))
-        features.append(self._safe_kurtosis(mfccs))
-
-        raw_embedding = np.concatenate(features)
-
-        # Project to target dimension
-        embedding = self._project_to_dim(
-            raw_embedding, self.config.embedding_dim
-        )
-
-        # L2 normalize
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-
-        return embedding.astype(np.float32)
-
-    def enroll(self, speaker_id: str, segment: AudioSegment) -> np.ndarray:
-        """Enroll a speaker for later identification.
-
-        Args:
-            speaker_id: Unique identifier for the speaker.
-            segment: Audio sample of the speaker.
-
-        Returns:
-            The enrolled speaker's embedding.
-        """
-        embedding = self.extract_embedding(segment)
-        self._enrolled[speaker_id] = embedding
-        return embedding
-
-    def verify(
-        self, segment: AudioSegment, claimed_id: str
-    ) -> tuple[bool, float]:
-        """Verify if audio matches a claimed speaker identity.
-
-        Args:
-            segment: Audio segment to verify.
-            claimed_id: Speaker ID to verify against.
-
-        Returns:
-            Tuple of (is_match, similarity_score).
-        """
-        if claimed_id not in self._enrolled:
-            return False, 0.0
-
-        embedding = self.extract_embedding(segment)
-        enrolled = self._enrolled[claimed_id]
-        similarity = self._cosine_similarity(embedding, enrolled)
-
-        # Threshold for verification
-        threshold = 0.75
-        return similarity >= threshold, float(similarity)
-
-    def compare(
-        self, segment_a: AudioSegment, segment_b: AudioSegment
-    ) -> float:
-        """Compare two audio segments and return speaker similarity.
-
-        Args:
-            segment_a: First audio segment.
-            segment_b: Second audio segment.
-
-        Returns:
-            Cosine similarity score between -1.0 and 1.0.
-        """
-        emb_a = self.extract_embedding(segment_a)
-        emb_b = self.extract_embedding(segment_b)
-        return float(self._cosine_similarity(emb_a, emb_b))
-
-    def _identify(self, embedding: np.ndarray) -> tuple[Optional[str], float]:
-        """Identify a speaker from enrolled speakers."""
-        if not self._enrolled:
-            return None, 0.0
-
-        best_id = None
-        best_score = -1.0
-
-        for speaker_id, enrolled_emb in self._enrolled.items():
-            score = self._cosine_similarity(embedding, enrolled_emb)
-            if score > best_score:
-                best_score = score
-                best_id = speaker_id
-
-        if best_score >= 0.75:
-            return best_id, float(best_score)
-        return None, float(best_score)
-
-    def _project_to_dim(
-        self, features: np.ndarray, target_dim: int
-    ) -> np.ndarray:
-        """Deterministically project features to target dimensionality.
-
-        Uses a seeded random projection matrix for consistent embeddings.
-        """
-        if len(features) == target_dim:
-            return features
-
-        # Deterministic projection using feature-derived seed
-        seed_bytes = hashlib.sha256(
-            np.array(features.shape).tobytes()
-        ).digest()
-        seed = int.from_bytes(seed_bytes[:4], "big") % (2**31)
-        rng = np.random.RandomState(seed)
-
-        if len(features) > target_dim:
-            # Random projection to lower dimension
-            proj_matrix = rng.randn(target_dim, len(features)).astype(
-                np.float32
-            )
-            proj_matrix /= np.sqrt(len(features))
-            return proj_matrix @ features
-        else:
-            # Pad and project
-            padded = np.zeros(target_dim, dtype=np.float32)
-            padded[: len(features)] = features
-            return padded
-
-    @staticmethod
-    def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-        """Compute cosine similarity between two vectors."""
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return float(np.dot(a, b) / (norm_a * norm_b))
-
-    @staticmethod
-    def _safe_skewness(data: np.ndarray) -> np.ndarray:
-        """Compute skewness along axis 1, handling edge cases."""
-        mean = np.mean(data, axis=1, keepdims=True)
-        std = np.std(data, axis=1, keepdims=True)
-        std = np.where(std == 0, 1, std)
-        return np.mean(((data - mean) / std) ** 3, axis=1)
-
-    @staticmethod
-    def _safe_kurtosis(data: np.ndarray) -> np.ndarray:
-        """Compute kurtosis along axis 1, handling edge cases."""
-        mean = np.mean(data, axis=1, keepdims=True)
-        std = np.std(data, axis=1, keepdims=True)
-        std = np.where(std == 0, 1, std)
-        return np.mean(((data - mean) / std) ** 4, axis=1) - 3
+# Backward-compatible alias so existing SDK imports keep working
+SpeakerDetector = VoiceBiometrics
